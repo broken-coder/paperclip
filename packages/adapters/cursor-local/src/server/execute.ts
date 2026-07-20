@@ -12,6 +12,7 @@ import {
   adapterExecutionTargetUsesManagedHome,
   adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
+  mergeAdapterExecutionTargetPaperclipBridgeEnv,
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
@@ -464,7 +465,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onLog,
     });
     if (paperclipBridge) {
-      Object.assign(env, paperclipBridge.env);
+      mergeAdapterExecutionTargetPaperclipBridgeEnv(env, paperclipBridge.env);
       loggedEnv = buildInvocationEnvForLogs(env, {
         runtimeEnv: ensurePathInEnv({ ...process.env, ...env }),
         includeRuntimeKeys: ["HOME"],

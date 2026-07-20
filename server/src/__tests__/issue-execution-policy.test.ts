@@ -43,6 +43,20 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
   });
 
+  it("keeps an enabled one-shot policy without stages", () => {
+    expect(
+      normalizeIssueExecutionPolicy({
+        stages: [],
+        oneShot: { enabled: true },
+      }),
+    ).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+      oneShot: { enabled: true },
+    });
+  });
+
   it("throws when all participants are invalid (missing agentId)", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({

@@ -1104,4 +1104,155 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       },
     });
   });
+
+  it("suppresses one-shot comment wakes but permits a first assignment wake after reassignment", async () => {
+    const companyId = randomUUID();
+    const initialAgentId = randomUUID();
+    const reassignedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const normalIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: initialAgentId,
+        companyId,
+        name: "InitialLead",
+        role: "lead",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: reassignedAgentId,
+        companyId,
+        name: "ReassignedLead",
+        role: "lead",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Exactly one smoke",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: initialAgentId,
+        responsibleUserId: "responsible-user",
+        executionPolicy: { oneShot: { enabled: true } },
+      },
+      {
+        id: normalIssueId,
+        companyId,
+        title: "Normal comment wake",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: initialAgentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+
+    const initialWake = await heartbeat.wakeup(initialAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(initialWake).not.toBeNull();
+
+    const initialRunFinished = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, initialWake!.id))
+        .then((rows) => rows[0] ?? null);
+      return Boolean(run && run.status !== "queued" && run.status !== "running");
+    });
+    expect(initialRunFinished).toBe(true);
+
+    const commentWake = await heartbeat.wakeup(initialAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: randomUUID() },
+      contextSnapshot: { issueId, wakeReason: "issue_commented" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(commentWake).toBeNull();
+
+    const oneShotWakeups = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`)
+      .orderBy(agentWakeupRequests.requestedAt);
+    expect(oneShotWakeups).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: "issue_assigned" }),
+      expect.objectContaining({
+        status: "skipped",
+        reason: "issue.one_shot_suppressed",
+        payload: expect.objectContaining({
+          heartbeatSkip: expect.objectContaining({ requestedReason: "issue_commented" }),
+        }),
+      }),
+    ]));
+
+    const suppressionActivities = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.one_shot_wakeup_suppressed"),
+      ));
+    const suppressionActivity = suppressionActivities.find((activity) =>
+      (activity.details as { requestedReason?: unknown } | null)?.requestedReason === "issue_commented",
+    );
+    expect(suppressionActivity).toMatchObject({
+      action: "issue.one_shot_wakeup_suppressed",
+      details: expect.objectContaining({ requestedReason: "issue_commented" }),
+    });
+
+    await db.update(issues).set({ assigneeAgentId: reassignedAgentId }).where(eq(issues.id, issueId));
+    const reassignedWake = await heartbeat.wakeup(reassignedAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(reassignedWake).not.toBeNull();
+
+    const normalCommentWake = await heartbeat.wakeup(initialAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: normalIssueId, commentId: randomUUID() },
+      contextSnapshot: { issueId: normalIssueId, wakeReason: "issue_commented" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(normalCommentWake).not.toBeNull();
+  });
 });
