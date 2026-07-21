@@ -1357,6 +1357,72 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
   });
 
+  it("does not enqueue a process-loss retry for a one-shot issue", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+    });
+    await db
+      .update(issues)
+      .set({ executionPolicy: { oneShot: { enabled: true } } })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: runId, status: "failed", errorCode: "process_lost" });
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ executionRunId: null, checkoutRunId: null });
+
+    const suppressionActivity = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.action, "issue.one_shot_recovery_suppressed"),
+        eq(activityLog.entityId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(suppressionActivity).toMatchObject({
+      action: "issue.one_shot_recovery_suppressed",
+      entityId: issueId,
+      details: expect.objectContaining({ sourceRunId: runId }),
+    });
+  });
+
+  it("does not enqueue continuation recovery after a one-shot run is already lost", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    await db
+      .update(issues)
+      .set({ executionPolicy: { oneShot: { enabled: true } } })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: runId, status: "failed", errorCode: "process_lost" });
+  });
+
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
     mockAdapterExecute.mockRejectedValueOnce(new Error("continuation recovery failed"));
 

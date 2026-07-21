@@ -122,6 +122,32 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     return null;
   }
 
+  async function waitForRunStatus(runId: string, status: "queued" | "running") {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (run?.status === status) return run;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return null;
+  }
+
+  async function waitForRunEvent(runId: string, message: string) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const event = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(sql`${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.message} = ${message}`)
+        .then((rows) => rows[0] ?? null);
+      if (event) return event;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return null;
+  }
+
   async function waitForRuntimeStateLastRun(agentId: string, runId: string) {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const state = await db
@@ -213,6 +239,52 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     expect(runningCount).toBe(0);
   });
 
+  it("returns a claimed run to the queue when scheduling becomes suppressed before execution starts", async () => {
+    const { agentId, issueId } = await insertAgentAndIssue();
+    let worktreeReads = 0;
+    const runtimeEnv = Object.create(null) as Record<string, string | undefined>;
+    Object.defineProperty(runtimeEnv, "PAPERCLIP_IN_WORKTREE", {
+      enumerable: true,
+      get: () => {
+        worktreeReads += 1;
+        return worktreeReads >= 3 ? "true" : undefined;
+      },
+    });
+    const heartbeat = heartbeatService(db, { runtimeEnv });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system",
+      requestedByActorId: "issue_assignment",
+    });
+
+    expect(run).not.toBeNull();
+    const requeued = await waitForRunStatus(run!.id, "queued");
+    expect(requeued).toMatchObject({ status: "queued" });
+    expect(await waitForRunEvent(
+      run!.id,
+      "Requeued claimed heartbeat run because scheduling became suppressed before execution started",
+    )).not.toBeNull();
+
+    const wakeup = await db
+      .select({ status: agentWakeupRequests.status, claimedAt: agentWakeupRequests.claimedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, run!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "queued", claimedAt: null });
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+  });
+
   it("still creates live-plane assignment runs when suppression is not active", async () => {
     const { agentId, issueId } = await insertAgentAndIssue();
     const heartbeat = heartbeatService(db, { runtimeEnv: {} });
@@ -231,11 +303,12 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     const terminalStatus = await waitForTerminalRun(run!.id);
     expect(["succeeded", null]).toContain(terminalStatus);
 
-    const runCount = await db
-      .select({ count: sql<number>`count(*)::int` })
+    const assignmentRun = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .then((rows) => rows[0]?.count ?? 0);
-    expect(runCount).toBe(1);
+      .where(eq(heartbeatRuns.id, run!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(assignmentRun).toMatchObject({ id: run!.id });
 
     await db
       .update(issues)

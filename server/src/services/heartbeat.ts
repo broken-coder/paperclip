@@ -4890,6 +4890,10 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+function hasOneShotExecutionPolicy(executionPolicy: unknown) {
+  return parseObject(parseObject(executionPolicy).oneShot).enabled === true;
+}
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
 ): { suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | null } {
@@ -9751,7 +9755,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const processLossRetryEligible =
+        tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+      const issuePolicy = issueId
+        ? await db
+            .select({ executionPolicy: issues.executionPolicy })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+            .then((rows) => rows[0]?.executionPolicy ?? null)
+        : null;
+      const oneShotRecoverySuppressed = processLossRetryEligible && hasOneShotExecutionPolicy(issuePolicy);
+      const shouldRetry = processLossRetryEligible && !oneShotRecoverySuppressed;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
@@ -9797,13 +9812,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
+        message: oneShotRecoverySuppressed
+          ? `${baseMessage}; automatic retry suppressed by one-shot issue policy`
+          : shouldRetry
+            ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+            : baseMessage,
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+          ...(oneShotRecoverySuppressed ? { oneShotRecoverySuppressed: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
       });
@@ -10028,8 +10046,100 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  async function requeueClaimedRunForSchedulingSuppression(
+    run: typeof heartbeatRuns.$inferSelect,
+    suppression: { reason: "worktree_instance" | "database_restore_in_progress" | null },
+  ) {
+    const now = new Date();
+    const requeued = await db.transaction(async (tx) => {
+      const updatedRun = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "queued",
+          startedAt: null,
+          processStartedAt: null,
+          processPid: null,
+          processGroupId: null,
+          updatedAt: now,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updatedRun) return null;
+
+      if (updatedRun.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "queued",
+            claimedAt: null,
+            finishedAt: null,
+            error: null,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, updatedRun.wakeupRequestId));
+      }
+
+      const issueId = readNonEmptyString(parseObject(updatedRun.contextSnapshot).issueId);
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, updatedRun.companyId),
+              eq(issues.executionRunId, updatedRun.id),
+            ),
+          );
+      }
+
+      return updatedRun;
+    });
+    if (!requeued) return null;
+
+    publishLiveEvent({
+      companyId: requeued.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: requeued.id,
+        agentId: requeued.agentId,
+        status: requeued.status,
+        invocationSource: requeued.invocationSource,
+        triggerDetail: requeued.triggerDetail,
+        error: requeued.error ?? null,
+        errorCode: requeued.errorCode ?? null,
+        startedAt: null,
+        finishedAt: null,
+      },
+    });
+    publishRunLifecyclePluginEvent(requeued);
+    await appendRunEvent(requeued, await nextRunEventSeq(requeued.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Requeued claimed heartbeat run because scheduling became suppressed before execution started",
+      payload: {
+        reason: suppression.reason,
+      },
+    });
+    return requeued;
+  }
+
   async function executeRun(runId: string) {
-    if (getSchedulingSuppression().suppressed) return;
+    const schedulingSuppression = getSchedulingSuppression();
+    if (schedulingSuppression.suppressed) {
+      const run = await getRun(runId);
+      if (run?.status === "running") {
+        await requeueClaimedRunForSchedulingSuppression(run, schedulingSuppression);
+      }
+      return;
+    }
 
     let run = await getRun(runId);
     if (!run) return;
@@ -12860,6 +12970,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
 
+        if (hasOneShotExecutionPolicy(issue.executionPolicy)) {
+          return {
+            kind: "one_shot_recovery_suppressed" as const,
+            issue,
+            recoveryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
+          };
+        }
+
         const now = new Date();
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
@@ -12996,6 +13114,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      if (hasOneShotExecutionPolicy(issue.executionPolicy)) {
+        return {
+          kind: "one_shot_recovery_suppressed" as const,
+          issue,
+          recoveryReason: issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed",
+        };
+      }
+
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
@@ -13116,6 +13242,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: promotionResult.issue,
         previousStatus: promotionResult.previousStatus as "todo" | "in_progress" | "in_review",
         latestRun: run,
+      });
+      return;
+    }
+
+    if (promotionResult?.kind === "one_shot_recovery_suppressed") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Automatic issue recovery suppressed by one-shot execution policy",
+        payload: {
+          issueId: promotionResult.issue.id,
+          recoveryReason: promotionResult.recoveryReason,
+        },
+      });
+      await logActivity(db, {
+        companyId: promotionResult.issue.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "issue.one_shot_recovery_suppressed",
+        entityType: "issue",
+        entityId: promotionResult.issue.id,
+        details: {
+          recoveryReason: promotionResult.recoveryReason,
+          sourceRunId: run.id,
+        },
       });
       return;
     }
