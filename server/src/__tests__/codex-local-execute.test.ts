@@ -58,6 +58,12 @@ type LogEntry = {
   chunk: string;
 };
 
+const latestTaskMarkdown = [
+  "## Current Paperclip Issue",
+  "- fileKey: vU48DwXArNDYEZaajx8gVt",
+  "- node: 2:2",
+].join("\n");
+
 async function seedSharedCodexAuth(homeRoot: string): Promise<void> {
   const sharedCodexHome = path.join(homeRoot, ".codex");
   await fs.mkdir(sharedCodexHome, { recursive: true });
@@ -435,6 +441,7 @@ describe("codex execute", () => {
           taskId: "issue-1",
           wakeReason: "issue_commented",
           wakeCommentId: "comment-2",
+          paperclipTaskMarkdown: latestTaskMarkdown,
           paperclipWake: {
             reason: "issue_commented",
             issue: {
@@ -496,6 +503,7 @@ describe("codex execute", () => {
       );
       expect(capture.prompt).toContain("First comment");
       expect(capture.prompt).toContain("Second comment");
+      expect(capture.prompt).toContain(latestTaskMarkdown);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -996,6 +1004,7 @@ describe("codex execute", () => {
           taskId: "issue-1",
           wakeReason: "issue_commented",
           wakeCommentId: "comment-2",
+          paperclipTaskMarkdown: latestTaskMarkdown,
           paperclipWake: {
             reason: "issue_commented",
             issue: {
@@ -1043,13 +1052,16 @@ describe("codex execute", () => {
       expect(capture.prompt).toContain("## Paperclip Resume Delta");
       expect(capture.prompt).toContain("Do not switch to another issue until you have handled this wake.");
       expect(capture.prompt).toContain("Second comment");
+      expect(capture.prompt).toContain(latestTaskMarkdown);
       expect(capture.prompt).not.toContain("Follow the paperclip heartbeat.");
       expect(capture.prompt).not.toContain("You are managed instructions.");
       expect(invocationPrompt).toContain("## Paperclip Resume Delta");
+      expect(invocationPrompt).toContain(latestTaskMarkdown);
       expect(invocationNotes).toContain(
         "Skipped stdin instruction reinjection because an existing Codex session is being resumed with a wake delta.",
       );
       expect(promptMetrics.instructionsChars).toBe(0);
+      expect(promptMetrics.taskContextChars).toBe(latestTaskMarkdown.length);
       expect(promptMetrics.heartbeatPromptChars).toBe(0);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
